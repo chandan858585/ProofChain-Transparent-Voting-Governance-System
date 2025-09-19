@@ -1,4 +1,4 @@
-
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
 contract Project {
@@ -115,5 +115,26 @@ contract Project {
             proposalIds[i - 1] = i;
         }
         return proposalIds;
+    }
+    
+    // Core Function 4: Execute Proposal
+    function executeProposal(uint256 _proposalId) external onlyVoter {
+        require(_proposalId > 0 && _proposalId <= proposalCount, "Invalid proposal ID");
+        Proposal storage proposal = proposals[_proposalId];
+        
+        // Ensure the proposal has not already been executed
+        require(!proposal.executed, "Proposal already executed");
+        
+        // Ensure the voting period has ended
+        require(block.timestamp > proposal.deadline, "Voting period not ended yet");
+        
+        // Ensure the proposal has sufficient "for" votes to pass
+        require(proposal.forVotes > proposal.againstVotes, "Proposal did not pass");
+
+        // Mark the proposal as executed
+        proposal.executed = true;
+        
+        // Emit an event for proposal execution
+        emit ProposalExecuted(_proposalId);
     }
 }
