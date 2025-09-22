@@ -19,10 +19,13 @@ contract Project {
     
     uint256 public proposalCount;
     address public admin;
-    
+    uint256 public quorum; // minimum total votes required
+
     event ProposalCreated(uint256 indexed proposalId, string title, address proposer);
     event VoteCast(uint256 indexed proposalId, address voter, bool support);
-    event ProposalExecuted(uint256 indexed proposalId);
+    event ProposalExecuted(uint256 indexed proposalId, bool success, uint256 forVotes, uint256 againstVotes);
+    event VoterRegistered(address voter);
+    event VoterRemoved(address voter);
     
     modifier onlyAdmin() {
         require(msg.sender == admin, "Only admin can perform this action");
@@ -34,9 +37,10 @@ contract Project {
         _;
     }
     
-    constructor() {
+    constructor(uint256 _quorum) {
         admin = msg.sender;
         isVoter[msg.sender] = true; // Admin is automatically a voter
+        quorum = _quorum;
     }
     
     // Core Function 1: Create Proposal
@@ -45,6 +49,8 @@ contract Project {
         string memory _description,
         uint256 _durationInDays
     ) external onlyVoter {
+        require(_durationInDays > 0, "Duration must be greater than zero");
+        
         proposalCount++;
         
         proposals[proposalCount] = Proposal({
@@ -103,18 +109,14 @@ contract Project {
             proposal.proposer
         );
     }
-    
-    // Additional utility functions
-    function registerVoter(address _voter) external onlyAdmin {
-        isVoter[_voter] = true;
-    }
-    
-    function getAllProposals() external view returns (uint256[] memory) {
-        uint256[] memory proposalIds = new uint256[](proposalCount);
+
+    // Modified Utility: Get All Proposals (full details)
+    function getAllProposals() external view returns (Proposal[] memory) {
+        Proposal[] memory allProposals = new Proposal[](proposalCount);
         for (uint256 i = 1; i <= proposalCount; i++) {
-            proposalIds[i - 1] = i;
+            allProposals[i - 1] = proposals[i];
         }
-        return proposalIds;
+        return allProposals;
     }
     
     // Core Function 4: Execute Proposal
@@ -122,19 +124,42 @@ contract Project {
         require(_proposalId > 0 && _proposalId <= proposalCount, "Invalid proposal ID");
         Proposal storage proposal = proposals[_proposalId];
         
-        // Ensure the proposal has not already been executed
         require(!proposal.executed, "Proposal already executed");
-        
-        // Ensure the voting period has ended
         require(block.timestamp > proposal.deadline, "Voting period not ended yet");
         
-        // Ensure the proposal has sufficient "for" votes to pass
-        require(proposal.forVotes > proposal.againstVotes, "Proposal did not pass");
+        uint256 totalVotes = proposal.forVotes + proposal.againstVotes;
+        require(totalVotes >= quorum, "Not enough votes to reach quorum");
 
-        // Mark the proposal as executed
+        bool success = proposal.forVotes > proposal.againstVotes;
+
         proposal.executed = true;
         
-        // Emit an event for proposal execution
-        emit ProposalExecuted(_proposalId);
+        emit ProposalExecuted(_proposalId, success, proposal.forVotes, proposal.againstVotes);
+    }
+
+    // Admin: Register voter
+    function registerVoter(address _voter) external onlyAdmin {
+        isVoter[_voter] = true;
+        emit VoterRegistered(_voter);
+    }
+
+    // Admin: Remove voter
+    function removeVoter(address _voter) external onlyAdmin {
+        isVoter[_voter] = false;
+        emit VoterRemoved(_voter);
+    }
+
+    // Proposer: Update proposal duration before voting ends
+    function updateProposalDuration(uint256 _proposalId, uint256 _extraDays) external {
+        Proposal storage proposal = proposals[_proposalId];
+        require(msg.sender == proposal.proposer, "Only proposer can extend deadline");
+        require(block.timestamp < proposal.deadline, "Voting period already ended");
+        proposal.deadline += (_extraDays * 1 days);
+    }
+
+    // Admin: Update quorum
+    function updateQuorum(uint256 _newQuorum) external onlyAdmin {
+        require(_newQuorum > 0, "Quorum must be greater than zero");
+        quorum = _newQuorum;
     }
 }
