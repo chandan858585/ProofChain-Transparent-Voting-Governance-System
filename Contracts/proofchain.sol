@@ -6,8 +6,8 @@ contract Project {
         uint256 id;
         string title;
         string description;
-        uint256 forVotes;
-        uint256 againstVotes;
+        uint256 forVotes;       // total weighted "for" votes
+        uint256 againstVotes;   // total weighted "against" votes
         uint256 deadline;
         bool executed;
         address proposer;
@@ -16,16 +16,18 @@ contract Project {
     mapping(uint256 => Proposal) public proposals;
     mapping(uint256 => mapping(address => bool)) public hasVoted;
     mapping(address => bool) public isVoter;
+    mapping(address => uint256) public votingPower; // weighted votes
     
     uint256 public proposalCount;
     address public admin;
-    uint256 public quorum; // minimum total votes required
+    uint256 public quorum; // minimum total weighted votes required
 
     event ProposalCreated(uint256 indexed proposalId, string title, address proposer);
-    event VoteCast(uint256 indexed proposalId, address voter, bool support);
+    event VoteCast(uint256 indexed proposalId, address voter, bool support, uint256 weight);
     event ProposalExecuted(uint256 indexed proposalId, bool success, uint256 forVotes, uint256 againstVotes);
-    event VoterRegistered(address voter);
+    event VoterRegistered(address voter, uint256 weight);
     event VoterRemoved(address voter);
+    event VoterWeightUpdated(address voter, uint256 newWeight);
     
     modifier onlyAdmin() {
         require(msg.sender == admin, "Only admin can perform this action");
@@ -39,7 +41,8 @@ contract Project {
     
     constructor(uint256 _quorum) {
         admin = msg.sender;
-        isVoter[msg.sender] = true; // Admin is automatically a voter
+        isVoter[msg.sender] = true; 
+        votingPower[msg.sender] = 1; // Admin starts with 1 voting power
         quorum = _quorum;
     }
     
@@ -67,21 +70,24 @@ contract Project {
         emit ProposalCreated(proposalCount, _title, msg.sender);
     }
     
-    // Core Function 2: Cast Vote
+    // Core Function 2: Cast Weighted Vote
     function vote(uint256 _proposalId, bool _support) external onlyVoter {
         require(_proposalId > 0 && _proposalId <= proposalCount, "Invalid proposal ID");
         require(!hasVoted[_proposalId][msg.sender], "Already voted");
         require(block.timestamp < proposals[_proposalId].deadline, "Voting period ended");
         
+        uint256 weight = votingPower[msg.sender];
+        require(weight > 0, "No voting power assigned");
+        
         hasVoted[_proposalId][msg.sender] = true;
         
         if (_support) {
-            proposals[_proposalId].forVotes++;
+            proposals[_proposalId].forVotes += weight;
         } else {
-            proposals[_proposalId].againstVotes++;
+            proposals[_proposalId].againstVotes += weight;
         }
         
-        emit VoteCast(_proposalId, msg.sender, _support);
+        emit VoteCast(_proposalId, msg.sender, _support, weight);
     }
     
     // Core Function 3: Get Proposal Details
@@ -110,7 +116,7 @@ contract Project {
         );
     }
 
-    // Modified Utility: Get All Proposals (full details)
+    // Utility: Get All Proposals
     function getAllProposals() external view returns (Proposal[] memory) {
         Proposal[] memory allProposals = new Proposal[](proposalCount);
         for (uint256 i = 1; i <= proposalCount; i++) {
@@ -119,7 +125,7 @@ contract Project {
         return allProposals;
     }
     
-    // Core Function 4: Execute Proposal
+    // Core Function 4: Execute Proposal (with weighted quorum)
     function executeProposal(uint256 _proposalId) external onlyVoter {
         require(_proposalId > 0 && _proposalId <= proposalCount, "Invalid proposal ID");
         Proposal storage proposal = proposals[_proposalId];
@@ -137,16 +143,26 @@ contract Project {
         emit ProposalExecuted(_proposalId, success, proposal.forVotes, proposal.againstVotes);
     }
 
-    // Admin: Register voter
-    function registerVoter(address _voter) external onlyAdmin {
+    // Admin: Register voter with voting weight
+    function registerVoter(address _voter, uint256 _weight) external onlyAdmin {
+        require(_weight > 0, "Weight must be > 0");
         isVoter[_voter] = true;
-        emit VoterRegistered(_voter);
+        votingPower[_voter] = _weight;
+        emit VoterRegistered(_voter, _weight);
     }
 
     // Admin: Remove voter
     function removeVoter(address _voter) external onlyAdmin {
         isVoter[_voter] = false;
+        votingPower[_voter] = 0;
         emit VoterRemoved(_voter);
+    }
+
+    // Admin: Update voter weight
+    function updateVoterWeight(address _voter, uint256 _newWeight) external onlyAdmin {
+        require(isVoter[_voter], "Not a registered voter");
+        votingPower[_voter] = _newWeight;
+        emit VoterWeightUpdated(_voter, _newWeight);
     }
 
     // Proposer: Update proposal duration before voting ends
@@ -163,3 +179,4 @@ contract Project {
         quorum = _newQuorum;
     }
 }
+
