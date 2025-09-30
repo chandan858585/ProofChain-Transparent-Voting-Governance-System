@@ -36,6 +36,7 @@ contract Project {
     event ProposalExecuted(uint256 indexed id, bool success);
     event ProposalCancelled(uint256 indexed id, address by);
     event VoterUpdated(address indexed voter, uint256 weight, bool removed);
+    event BatchVotersUpdated(address indexed by, uint256 count);
     event ProposalExtended(uint256 indexed id, uint256 newDeadline);
     event AdminTransferred(address indexed oldAdmin, address indexed newAdmin);
     event QuorumChanged(uint8 oldQuorum, uint8 newQuorum);
@@ -48,20 +49,33 @@ contract Project {
         _;
         locked = false;
     }
+    modifier proposalExists(uint256 id) {
+        require(proposals[id].id != 0, "Proposal not found");
+        _;
+    }
 
+    /// @param _quorumPercent quorum percent (1..100)
     constructor(uint8 _quorumPercent) {
         require(_quorumPercent > 0 && _quorumPercent <= 100, "Invalid quorum");
         admin = msg.sender;
+
+        // bootstrap admin as a voter with weight 1
         isVoter[msg.sender] = true;
         votingPower[msg.sender] = 1;
         totalVotingPower = 1;
+
         quorumPercent = _quorumPercent;
         locked = false;
     }
 
     // --- Core ---
+
     /// @notice Create a proposal. Snapshot of total voting power is taken at creation.
+    /// @param _title short title (non-empty)
+    /// @param _desc longer description
+    /// @param _days duration in days (>0)
     function createProposal(string calldata _title, string calldata _desc, uint256 _days) external onlyVoter {
+        require(bytes(_title).length > 0, "Title required");
         require(_days > 0, "Days must be > 0");
         require(totalVotingPower > 0, "No voting power in system");
 
@@ -83,7 +97,9 @@ contract Project {
     }
 
     /// @notice Cast your weighted vote on a proposal (one address, one vote per proposal).
-    function vote(uint256 id, bool support) external onlyVoter {
+    /// @param id proposal id
+    /// @param support true = for, false = against
+    function vote(uint256 id, bool support) external onlyVoter proposalExists(id) {
         Proposal storage p = proposals[id];
         require(!p.canceled, "Canceled");
         require(block.timestamp < p.deadline, "Voting closed");
@@ -103,7 +119,8 @@ contract Project {
     }
 
     /// @notice Finalize (execute) a proposal if quorum met and voting finished. Execution here is logical (emits result).
-    function executeProposal(uint256 id) external onlyVoter nonReentrant {
+    /// @param id proposal id
+    function executeProposal(uint256 id) external onlyVoter nonReentrant proposalExists(id) {
         Proposal storage p = proposals[id];
         require(!p.executed, "Already executed");
         require(!p.canceled, "Canceled");
@@ -111,6 +128,7 @@ contract Project {
 
         uint256 cast = p.forVotes + p.againstVotes;
         uint256 quorumNeeded = quorumFor(id);
+        require(quorumNeeded > 0, "Quorum undefined");
         require(cast >= quorumNeeded, "No quorum");
 
         p.executed = true;
@@ -120,7 +138,8 @@ contract Project {
     }
 
     /// @notice Cancel a proposal (by proposer or admin) before execution.
-    function cancelProposal(uint256 id) external {
+    /// @param id proposal id
+    function cancelProposal(uint256 id) external proposalExists(id) {
         Proposal storage p = proposals[id];
         require(!p.executed, "Already executed");
         require(!p.canceled, "Already canceled");
@@ -130,8 +149,11 @@ contract Project {
     }
 
     // --- Voters management ---
-    /// @notice Add/update/remove voter weights. Admin only.
-    function setVoter(address voter, uint256 weight) external onlyAdmin {
+
+    /// @notice Add/update/remove voter weight. Admin only.
+    /// @param voter address to set
+    /// @param weight new weight (0 to remove)
+    function setVoter(address voter, uint256 weight) public onlyAdmin {
         require(voter != address(0), "Zero address");
         uint256 old = votingPower[voter];
 
@@ -152,13 +174,13 @@ contract Project {
         } else {
             if (isVoter[voter]) {
                 // adjust existing
-                // total = total - old + weight
                 if (weight > old) {
                     totalVotingPower += (weight - old);
                 } else {
                     totalVotingPower -= (old - weight);
                 }
             } else {
+                // new voter
                 isVoter[voter] = true;
                 totalVotingPower += weight;
             }
@@ -167,9 +189,24 @@ contract Project {
         }
     }
 
+    /// @notice Batch add/update/remove multiple voters in one call. Admin only.
+    /// @dev Arrays must match lengths.
+    /// @param voters list of addresses
+    /// @param weights corresponding weights (0 removes)
+    function batchSetVoters(address[] calldata voters, uint256[] calldata weights) external onlyAdmin {
+        require(voters.length == weights.length, "Length mismatch");
+        for (uint256 i = 0; i < voters.length; i++) {
+            setVoter(voters[i], weights[i]);
+        }
+        emit BatchVotersUpdated(msg.sender, voters.length);
+    }
+
     // --- Utilities ---
+
     /// @notice Extend a proposal's deadline (only proposer, before deadline).
-    function extendProposal(uint256 id, uint256 extraDays) external {
+    /// @param id proposal id
+    /// @param extraDays additional days to add (>0)
+    function extendProposal(uint256 id, uint256 extraDays) external proposalExists(id) {
         require(extraDays > 0, "Extra days > 0");
         Proposal storage p = proposals[id];
         require(msg.sender == p.proposer, "Only proposer");
@@ -181,6 +218,7 @@ contract Project {
     }
 
     /// @notice Change quorum percent (admin).
+    /// @param q new quorum percent (1..100)
     function setQuorum(uint8 q) external onlyAdmin {
         require(q > 0 && q <= 100, "Invalid quorum");
         uint8 old = quorumPercent;
@@ -189,6 +227,7 @@ contract Project {
     }
 
     /// @notice Transfer admin rights.
+    /// @param n new admin address
     function transferAdmin(address n) external onlyAdmin {
         require(n != address(0), "Zero address");
         emit AdminTransferred(admin, n);
@@ -196,12 +235,39 @@ contract Project {
     }
 
     // --- Views / helpers ---
+
     /// @notice Returns the voting power required for quorum for a proposal (uses snapshot).
-    function quorumFor(uint256 id) public view returns (uint256) {
+    /// @dev Ceil(snapshot * quorumPercent / 100)
+    function quorumFor(uint256 id) public view proposalExists(id) returns (uint256) {
         Proposal storage p = proposals[id];
-        // ceil(snapshot * quorumPercent / 100)
         if (p.totalVotingPowerSnapshot == 0) return 0;
-        return (p.totalVotingPowerSnapshot * quorumPercent + 99) / 100;
+        // ceil(snapshot * quorumPercent / 100)
+        return (p.totalVotingPowerSnapshot * quorumPercent + 100 - 1) / 100;
+    }
+
+    /// @notice Short helper to inspect proposal outcome & stats after voting closed.
+    /// @param id proposal id
+    /// @return passed true if forVotes > againstVotes (only meaningful once executed or after voting)
+    /// @return forVotes count
+    /// @return againstVotes count
+    /// @return cast total cast votes
+    /// @return quorumNeeded quorum threshold based on snapshot
+    /// @return snapshot snapshot of total voting power at creation
+    function proposalResult(uint256 id) external view proposalExists(id) returns (
+        bool passed,
+        uint256 forVotes,
+        uint256 againstVotes,
+        uint256 cast,
+        uint256 quorumNeeded,
+        uint256 snapshot
+    ) {
+        Proposal storage p = proposals[id];
+        forVotes = p.forVotes;
+        againstVotes = p.againstVotes;
+        cast = forVotes + againstVotes;
+        quorumNeeded = quorumFor(id);
+        snapshot = p.totalVotingPowerSnapshot;
+        passed = forVotes > againstVotes;
     }
 
     function votingPowerOf(address who) external view returns (uint256) {
@@ -213,11 +279,12 @@ contract Project {
     }
 
     /// @notice Get a proposal
-    function getProposal(uint256 id) external view returns (Proposal memory) {
+    function getProposal(uint256 id) external view proposalExists(id) returns (Proposal memory) {
         return proposals[id];
     }
 
-    /// @notice Get all proposals (1..proposalCount). If some ids were never created they will be zeroed structs.
+    /// @notice Get all proposals (1..proposalCount).
+    /// @dev If some ids were never created they would be zeroed structs. In this implementation proposals are created sequentially.
     function getAllProposals() external view returns (Proposal[] memory arr) {
         arr = new Proposal[](proposalCount);
         for (uint256 i = 1; i <= proposalCount; i++) {
@@ -225,4 +292,5 @@ contract Project {
         }
     }
 }
+
 
