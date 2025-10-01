@@ -22,6 +22,10 @@ contract Project {
     mapping(address => uint256) public votingPower;
     mapping(address => bool) public isVoter;
 
+    // For enumerating voters
+    address[] private votersList;
+    mapping(address => uint256) private voterIndex; // 1-based index into votersList (0 = not present)
+
     uint256 public proposalCount;
     uint256 public totalVotingPower;
     address public admin;
@@ -50,8 +54,8 @@ contract Project {
         locked = false;
     }
     modifier proposalExists(uint256 id) {
-        require(proposals[id].id != 0, "Proposal not found");
-        _;
+        require(id > 0 && id <= proposalCount, "Proposal not found");
+        _; 
     }
 
     /// @param _quorumPercent quorum percent (1..100)
@@ -64,8 +68,13 @@ contract Project {
         votingPower[msg.sender] = 1;
         totalVotingPower = 1;
 
+        // initialize voters list
+        votersList.push(msg.sender);
+        voterIndex[msg.sender] = 1; // 1-based
+
         quorumPercent = _quorumPercent;
         locked = false;
+        proposalCount = 0;
     }
 
     // --- Core ---
@@ -80,6 +89,7 @@ contract Project {
         require(totalVotingPower > 0, "No voting power in system");
 
         proposalCount++;
+        uint256 snapshot = totalVotingPower;
         proposals[proposalCount] = Proposal({
             id: proposalCount,
             title: _title,
@@ -90,10 +100,10 @@ contract Project {
             executed: false,
             canceled: false,
             proposer: msg.sender,
-            totalVotingPowerSnapshot: totalVotingPower
+            totalVotingPowerSnapshot: snapshot
         });
 
-        emit ProposalCreated(proposalCount, _title, msg.sender, totalVotingPower, quorumPercent);
+        emit ProposalCreated(proposalCount, _title, msg.sender, snapshot, quorumPercent);
     }
 
     /// @notice Cast your weighted vote on a proposal (one address, one vote per proposal).
@@ -155,6 +165,7 @@ contract Project {
     /// @param weight new weight (0 to remove)
     function setVoter(address voter, uint256 weight) public onlyAdmin {
         require(voter != address(0), "Zero address");
+
         uint256 old = votingPower[voter];
 
         // No-op if weight unchanged
@@ -168,8 +179,9 @@ contract Project {
             require(isVoter[voter], "Not a voter");
             require(totalVotingPower >= old, "Invariant"); // safe-guard
             totalVotingPower -= old;
-            isVoter[voter] = false;
             votingPower[voter] = 0;
+            isVoter[voter] = false;
+            _removeVoterFromList(voter);
             emit VoterUpdated(voter, 0, true);
         } else {
             if (isVoter[voter]) {
@@ -179,12 +191,14 @@ contract Project {
                 } else {
                     totalVotingPower -= (old - weight);
                 }
+                votingPower[voter] = weight;
             } else {
                 // new voter
                 isVoter[voter] = true;
+                votingPower[voter] = weight;
                 totalVotingPower += weight;
+                _addVoterToList(voter);
             }
-            votingPower[voter] = weight;
             emit VoterUpdated(voter, weight, false);
         }
     }
@@ -201,7 +215,7 @@ contract Project {
         emit BatchVotersUpdated(msg.sender, voters.length);
     }
 
-    // --- Utilities ---
+    // --- Utilities --- 
 
     /// @notice Extend a proposal's deadline (only proposer, before deadline).
     /// @param id proposal id
@@ -275,7 +289,7 @@ contract Project {
     }
 
     function hasProposal(uint256 id) external view returns (bool) {
-        return proposals[id].id != 0;
+        return (id > 0 && id <= proposalCount);
     }
 
     /// @notice Get a proposal
@@ -291,6 +305,31 @@ contract Project {
             arr[i - 1] = proposals[i];
         }
     }
-}
 
+    /// @notice Get current voters list (addresses)
+    function getVoters() external view returns (address[] memory) {
+        return votersList;
+    }
+
+    // --- Internal helpers for voter list management (O(1) removal via swap-pop) ---
+
+    function _addVoterToList(address who) internal {
+        // assume not present
+        votersList.push(who);
+        voterIndex[who] = votersList.length; // 1-based
+    }
+
+    function _removeVoterFromList(address who) internal {
+        uint256 idx = voterIndex[who];
+        require(idx != 0, "Not in list");
+        uint256 lastIndex = votersList.length;
+        if (idx != lastIndex) {
+            address last = votersList[lastIndex - 1];
+            votersList[idx - 1] = last;
+            voterIndex[last] = idx;
+        }
+        votersList.pop();
+        voterIndex[who] = 0;
+    }
+}
 
