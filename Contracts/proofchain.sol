@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-/// @title Weighted-DAO (shortened & improved)
-/// @notice Weighted voting with per-proposal voting power snapshot, quorum (percent), proposal cancellation and basic admin controls.
+/// @title Weighted-DAO (snapshot per-proposal, quorum, proposal cancellation, admin controls)
+/// @notice Improved version of the user's Project contract:
+///         - snapshots per-proposal voter weights at creation (so weights cannot be changed mid-vote)
+///         - pause/unpause for emergencies
+///         - small safety & API improvements
 contract Project {
     struct Proposal {
         uint256 id;
@@ -14,22 +17,32 @@ contract Project {
         bool executed;
         bool canceled;
         address proposer;
-        uint256 totalVotingPowerSnapshot;
+        uint256 totalVotingPowerSnapshot; // sum of snapshotWeights for that proposal
     }
 
     mapping(uint256 => Proposal) public proposals;
     mapping(uint256 => mapping(address => bool)) public hasVoted;
+
+    // Current live voting power and voter list
     mapping(address => uint256) public votingPower;
     mapping(address => bool) public isVoter;
-
-    // For enumerating voters
     address[] private votersList;
     mapping(address => uint256) private voterIndex; // 1-based index into votersList (0 = not present)
+
+    // Per-proposal snapshot of each voter's weight (set at proposal creation)
+    // WARNING: snapshotting iterates current votersList and writes to storage per voter.
+    // For very large voter lists this will be gas-expensive. Consider batched snapshotting
+    // or optimistic quorum checks if you expect thousands of voters.
+    mapping(uint256 => mapping(address => uint256)) public proposalVotingPowerSnapshot;
+    mapping(uint256 => address[]) private proposalVoters; // stored list of voters snapshot for that proposal (for view)
 
     uint256 public proposalCount;
     uint256 public totalVotingPower;
     address public admin;
     uint8 public quorumPercent;
+
+    // Pause flag
+    bool public paused;
 
     // Reentrancy guard
     bool private locked;
@@ -44,6 +57,8 @@ contract Project {
     event ProposalExtended(uint256 indexed id, uint256 newDeadline);
     event AdminTransferred(address indexed oldAdmin, address indexed newAdmin);
     event QuorumChanged(uint8 oldQuorum, uint8 newQuorum);
+    event Paused(address by);
+    event Unpaused(address by);
 
     modifier onlyAdmin() { require(msg.sender == admin, "Not admin"); _; }
     modifier onlyVoter() { require(isVoter[msg.sender], "Not voter"); _; }
@@ -56,6 +71,10 @@ contract Project {
     modifier proposalExists(uint256 id) {
         require(id > 0 && id <= proposalCount, "Proposal not found");
         _; 
+    }
+    modifier notPaused() {
+        require(!paused, "Paused");
+        _;
     }
 
     /// @param _quorumPercent quorum percent (1..100)
@@ -75,21 +94,40 @@ contract Project {
         quorumPercent = _quorumPercent;
         locked = false;
         proposalCount = 0;
+        paused = false;
     }
 
     // --- Core ---
 
-    /// @notice Create a proposal. Snapshot of total voting power is taken at creation.
+    /// @notice Create a proposal. Snapshot of per-voter voting power (and total) is taken at creation.
+    /// @dev Snapshotting writes one storage slot per voter. For large voter lists this is gas-costly.
+    ///      If you expect very large voter lists, consider implementing a batched snapshot or
+    ///      snapshot only total voting power (but that allows weight changes to affect votes).
     /// @param _title short title (non-empty)
     /// @param _desc longer description
     /// @param _days duration in days (>0)
-    function createProposal(string calldata _title, string calldata _desc, uint256 _days) external onlyVoter {
+    function createProposal(string calldata _title, string calldata _desc, uint256 _days) external onlyVoter notPaused {
         require(bytes(_title).length > 0, "Title required");
         require(_days > 0, "Days must be > 0");
         require(totalVotingPower > 0, "No voting power in system");
 
         proposalCount++;
-        uint256 snapshot = totalVotingPower;
+        uint256 snapshotTotal = 0;
+
+        // Snapshot every current voter weight
+        // Note: this loops through `votersList`. Be mindful of gas cost for big lists.
+        for (uint256 i = 0; i < votersList.length; i++) {
+            address v = votersList[i];
+            uint256 w = votingPower[v];
+            if (w == 0) continue; // skip zero weights
+            proposalVotingPowerSnapshot[proposalCount][v] = w;
+            proposalVoters[proposalCount].push(v);
+            snapshotTotal += w;
+        }
+
+        // Defensive: snapshotTotal should be equal to totalVotingPower if no zero-weights exist.
+        // However if some voters have weight 0 but are still in list, snapshotTotal may be < totalVotingPower.
+        // We still allow creation but record exactly what's snapshotted.
         proposals[proposalCount] = Proposal({
             id: proposalCount,
             title: _title,
@@ -100,23 +138,24 @@ contract Project {
             executed: false,
             canceled: false,
             proposer: msg.sender,
-            totalVotingPowerSnapshot: snapshot
+            totalVotingPowerSnapshot: snapshotTotal
         });
 
-        emit ProposalCreated(proposalCount, _title, msg.sender, snapshot, quorumPercent);
+        emit ProposalCreated(proposalCount, _title, msg.sender, snapshotTotal, quorumPercent);
     }
 
     /// @notice Cast your weighted vote on a proposal (one address, one vote per proposal).
+    /// @dev Uses the voter's weight as recorded in the proposal snapshot — weight changes after snapshot do not affect this vote.
     /// @param id proposal id
     /// @param support true = for, false = against
-    function vote(uint256 id, bool support) external onlyVoter proposalExists(id) {
+    function vote(uint256 id, bool support) external onlyVoter proposalExists(id) notPaused {
         Proposal storage p = proposals[id];
         require(!p.canceled, "Canceled");
         require(block.timestamp < p.deadline, "Voting closed");
         require(!hasVoted[id][msg.sender], "Already voted");
 
-        uint256 w = votingPower[msg.sender];
-        require(w > 0, "No voting weight");
+        uint256 w = proposalVotingPowerSnapshot[id][msg.sender];
+        require(w > 0, "No voting weight in snapshot");
 
         hasVoted[id][msg.sender] = true;
         if (support) {
@@ -130,7 +169,7 @@ contract Project {
 
     /// @notice Finalize (execute) a proposal if quorum met and voting finished. Execution here is logical (emits result).
     /// @param id proposal id
-    function executeProposal(uint256 id) external onlyVoter nonReentrant proposalExists(id) {
+    function executeProposal(uint256 id) external onlyVoter nonReentrant proposalExists(id) notPaused {
         Proposal storage p = proposals[id];
         require(!p.executed, "Already executed");
         require(!p.canceled, "Canceled");
@@ -215,7 +254,7 @@ contract Project {
         emit BatchVotersUpdated(msg.sender, voters.length);
     }
 
-    // --- Utilities --- 
+    // --- Utilities ---
 
     /// @notice Extend a proposal's deadline (only proposer, before deadline).
     /// @param id proposal id
@@ -246,6 +285,18 @@ contract Project {
         require(n != address(0), "Zero address");
         emit AdminTransferred(admin, n);
         admin = n;
+    }
+
+    /// @notice Pause core functions (create, vote, execute) in an emergency. Admin only.
+    function pause() external onlyAdmin {
+        paused = true;
+        emit Paused(msg.sender);
+    }
+
+    /// @notice Unpause contract. Admin only.
+    function unpause() external onlyAdmin {
+        paused = false;
+        emit Unpaused(msg.sender);
     }
 
     // --- Views / helpers ---
@@ -298,7 +349,6 @@ contract Project {
     }
 
     /// @notice Get all proposals (1..proposalCount).
-    /// @dev If some ids were never created they would be zeroed structs. In this implementation proposals are created sequentially.
     function getAllProposals() external view returns (Proposal[] memory arr) {
         arr = new Proposal[](proposalCount);
         for (uint256 i = 1; i <= proposalCount; i++) {
@@ -309,6 +359,16 @@ contract Project {
     /// @notice Get current voters list (addresses)
     function getVoters() external view returns (address[] memory) {
         return votersList;
+    }
+
+    /// @notice Get the list of voters that were snapshotted for a given proposal
+    function getProposalVoters(uint256 id) external view proposalExists(id) returns (address[] memory) {
+        return proposalVoters[id];
+    }
+
+    /// @notice Get the snapshot weight of a voter for a specific proposal
+    function getSnapshotWeight(uint256 id, address who) external view proposalExists(id) returns (uint256) {
+        return proposalVotingPowerSnapshot[id][who];
     }
 
     // --- Internal helpers for voter list management (O(1) removal via swap-pop) ---
