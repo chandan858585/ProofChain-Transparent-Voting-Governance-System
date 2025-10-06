@@ -44,8 +44,10 @@ contract Project {
     // Pause flag
     bool public paused;
 
-    // Reentrancy guard
-    bool private locked;
+    // Reentrancy guard (OpenZeppelin-style)
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+    uint256 private _status;
 
     // Events
     event ProposalCreated(uint256 indexed id, string title, address indexed proposer, uint256 snapshot, uint8 quorum);
@@ -59,14 +61,16 @@ contract Project {
     event QuorumChanged(uint8 oldQuorum, uint8 newQuorum);
     event Paused(address by);
     event Unpaused(address by);
+    event RecoveredERC20(address token, uint256 amount, address to);
+    event RecoveredETH(uint256 amount, address to);
 
     modifier onlyAdmin() { require(msg.sender == admin, "Not admin"); _; }
     modifier onlyVoter() { require(isVoter[msg.sender], "Not voter"); _; }
     modifier nonReentrant() {
-        require(!locked, "Reentrant");
-        locked = true;
+        require(_status != _ENTERED, "Reentrant");
+        _status = _ENTERED;
         _;
-        locked = false;
+        _status = _NOT_ENTERED;
     }
     modifier proposalExists(uint256 id) {
         require(id > 0 && id <= proposalCount, "Proposal not found");
@@ -74,7 +78,7 @@ contract Project {
     }
     modifier notPaused() {
         require(!paused, "Paused");
-        _;
+        _; 
     }
 
     /// @param _quorumPercent quorum percent (1..100)
@@ -92,7 +96,7 @@ contract Project {
         voterIndex[msg.sender] = 1; // 1-based
 
         quorumPercent = _quorumPercent;
-        locked = false;
+        _status = _NOT_ENTERED;
         proposalCount = 0;
         paused = false;
     }
@@ -299,6 +303,31 @@ contract Project {
         emit Unpaused(msg.sender);
     }
 
+    // --- Rescue funds (admin only) ---
+
+    /// @notice Recover ERC20 tokens accidentally sent to this contract.
+    /// @param token ERC20 token address
+    /// @param to destination address
+    /// @param amount amount to recover
+    function recoverERC20(address token, address to, uint256 amount) external onlyAdmin {
+        require(to != address(0), "Zero address");
+        require(token != address(0), "Zero token");
+        // minimal ERC20 transfer interface
+        (bool success, bytes memory data) = token.call(abi.encodeWithSignature("transfer(address,uint256)", to, amount));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), "ERC20 transfer failed");
+        emit RecoveredERC20(token, amount, to);
+    }
+
+    /// @notice Recover ETH accidentally sent to this contract.
+    /// @param to destination address
+    /// @param amount amount to send
+    function recoverETH(address to, uint256 amount) external onlyAdmin {
+        require(to != address(0), "Zero address");
+        (bool success, ) = to.call{value: amount}("");
+        require(success, "ETH transfer failed");
+        emit RecoveredETH(amount, to);
+    }
+
     // --- Views / helpers ---
 
     /// @notice Returns the voting power required for quorum for a proposal (uses snapshot).
@@ -371,6 +400,11 @@ contract Project {
         return proposalVotingPowerSnapshot[id][who];
     }
 
+    /// @notice Get total number of proposals created so far.
+    function getProposalCount() external view returns (uint256) {
+        return proposalCount;
+    }
+
     // --- Internal helpers for voter list management (O(1) removal via swap-pop) ---
 
     function _addVoterToList(address who) internal {
@@ -391,5 +425,8 @@ contract Project {
         votersList.pop();
         voterIndex[who] = 0;
     }
-}
 
+    // Allow contract to receive ETH (in case someone sends by mistake)
+    receive() external payable {}
+    fallback() external payable {}
+}
