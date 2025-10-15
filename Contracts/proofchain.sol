@@ -34,7 +34,8 @@ contract Project {
     bool public paused;
 
     // ---- Events ----
-    event ProposalCreated(uint256 indexed id, string title, address indexed proposer, uint256 deadline);
+    // added totalVotingPowerSnapshot to ProposalCreated for convenience
+    event ProposalCreated(uint256 indexed id, string title, address indexed proposer, uint256 deadline, uint256 totalVotingPowerSnapshot);
     event VoteCast(uint256 indexed id, address indexed voter, bool support, uint256 weight);
     event ProposalExecuted(uint256 indexed id, bool passed);
     event ProposalCancelled(uint256 indexed id);
@@ -43,6 +44,7 @@ contract Project {
     event AdminTransferred(address indexed oldAdmin, address indexed newAdmin);
     event Paused(address by);
     event Unpaused(address by);
+    event ProposalSnapshotsCleared(uint256 indexed id, address by);
 
     // ---- Modifiers ----
     modifier onlyAdmin() { require(msg.sender == admin, "Not admin"); _; }
@@ -65,6 +67,7 @@ contract Project {
         proposalCount++;
         uint256 total;
         // take per-voter snapshot and compute total snapshot voting power
+        // only store non-zero weights to reduce storage
         for(uint i = 0; i < votersList.length; i++){
             address v = votersList[i];
             uint256 w = votingPower[v];
@@ -87,7 +90,7 @@ contract Project {
             totalVotingPowerSnapshot: total
         });
 
-        emit ProposalCreated(proposalCount, t, msg.sender, proposals[proposalCount].deadline);
+        emit ProposalCreated(proposalCount, t, msg.sender, proposals[proposalCount].deadline, total);
     }
 
     function vote(uint256 id,bool support) external onlyVoter proposalExists(id) notPaused {
@@ -191,8 +194,9 @@ contract Project {
     // ---- Utility Views ----
     function quorumFor(uint256 id) public view returns(uint256){
         Proposal storage p = proposals[id];
-        // rounding up: (total * quorum + 99) / 100
-        return (p.totalVotingPowerSnapshot * quorumPercent + 99) / 100;
+        // rounding up: (total * quorum + 100 - 1) / 100
+        // explicit 100 - 1 makes intent clear
+        return (p.totalVotingPowerSnapshot * quorumPercent + 100 - 1) / 100;
     }
 
     /// @notice Return the full voters list (careful: can be large)
@@ -205,6 +209,28 @@ contract Project {
 
     function getSnapshotWeight(uint256 id, address who) external view proposalExists(id) returns(uint256) {
         return snapshot[id][who];
+    }
+
+    /// @notice Convenience: return the Proposal struct
+    function getProposal(uint256 id) external view proposalExists(id) returns (Proposal memory) {
+        return proposals[id];
+    }
+
+    // ---- Storage-cleanup helper ----
+    /// @notice Clears stored per-proposal snapshots and voters list for a processed proposal.
+    /// Use to reclaim storage after a proposal is executed or cancelled.
+    function clearProposalSnapshots(uint256 id) external onlyAdmin proposalExists(id) {
+        Proposal storage p = proposals[id];
+        require(p.executed || p.canceled, "Only processed proposals");
+        address[] storage pv = proposalVoters[id];
+        for (uint i = 0; i < pv.length; i++) {
+            address v = pv[i];
+            // delete snapshot weight (sets to 0)
+            delete snapshot[id][v];
+        }
+        // delete the array of voters
+        delete proposalVoters[id];
+        emit ProposalSnapshotsCleared(id, msg.sender);
     }
 
     // ---- Internal ----
