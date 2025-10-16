@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+          // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
 /// @title Simple DAO-style Proposal & Snapshot Voting (improved)
@@ -34,12 +34,12 @@ contract Project {
     bool public paused;
 
     // ---- Events ----
-    // added totalVotingPowerSnapshot to ProposalCreated for convenience
     event ProposalCreated(uint256 indexed id, string title, address indexed proposer, uint256 deadline, uint256 totalVotingPowerSnapshot);
     event VoteCast(uint256 indexed id, address indexed voter, bool support, uint256 weight);
     event ProposalExecuted(uint256 indexed id, bool passed);
     event ProposalCancelled(uint256 indexed id);
     event VoterUpdated(address indexed voter, uint256 weight);
+    event VoterRemoved(address indexed voter);
     event ParameterUpdated(string parameter, uint256 newValue);
     event AdminTransferred(address indexed oldAdmin, address indexed newAdmin);
     event Paused(address by);
@@ -49,12 +49,12 @@ contract Project {
     // ---- Modifiers ----
     modifier onlyAdmin() { require(msg.sender == admin, "Not admin"); _; }
     modifier onlyVoter() { require(isVoter[msg.sender], "Not voter"); _; }
-    modifier proposalExists(uint256 id){ require(id>0&&id<=proposalCount,"No proposal"); _; }
+    modifier proposalExists(uint256 id){ require(proposals[id].id != 0, "No proposal"); _; }
     modifier notPaused(){ require(!paused,"Paused"); _; }
 
     // ---- Constructor ----
     constructor(uint8 _q){ 
-        require(_q>0&&_q<=100,"Invalid quorum");
+        require(_q>0 && _q<=100,"Invalid quorum");
         admin = msg.sender;
         // initial admin is also a voter with weight 1
         _addNewVoter(msg.sender, 1);
@@ -62,23 +62,29 @@ contract Project {
     }
 
     // ---- Core DAO Functions ----
+    /// @notice Create a proposal and snapshot current voter weights (non-zero only)
     function createProposal(string calldata t,string calldata d,uint256 days_) external onlyVoter notPaused {
         require(bytes(t).length>0 && days_>0,"Invalid input");
         proposalCount++;
+        uint256 pid = proposalCount;
         uint256 total;
+
         // take per-voter snapshot and compute total snapshot voting power
         // only store non-zero weights to reduce storage
-        for(uint i = 0; i < votersList.length; i++){
+        uint256 len = votersList.length;
+        for (uint256 i = 0; i < len; ) {
             address v = votersList[i];
             uint256 w = votingPower[v];
-            if(w == 0) continue;
-            snapshot[proposalCount][v] = w;
-            proposalVoters[proposalCount].push(v);
-            total += w;
+            if (w != 0) {
+                snapshot[pid][v] = w;
+                proposalVoters[pid].push(v);
+                total += w;
+            }
+            unchecked { ++i; }
         }
 
-        proposals[proposalCount] = Proposal({
-            id: proposalCount,
+        proposals[pid] = Proposal({
+            id: pid,
             title: t,
             description: d,
             forVotes: 0,
@@ -90,7 +96,7 @@ contract Project {
             totalVotingPowerSnapshot: total
         });
 
-        emit ProposalCreated(proposalCount, t, msg.sender, proposals[proposalCount].deadline, total);
+        emit ProposalCreated(pid, t, msg.sender, proposals[pid].deadline, total);
     }
 
     function vote(uint256 id,bool support) external onlyVoter proposalExists(id) notPaused {
@@ -124,39 +130,51 @@ contract Project {
     function setVoter(address v,uint256 w) public onlyAdmin {
         require(v!=address(0),"Zero addr");
         uint256 old = votingPower[v];
-        if(w == 0) {
-            // remove voter
-            if(isVoter[v]){
-                // reduce totalVotingPower by their old weight
-                if(old > 0 && totalVotingPower >= old) {
+
+        if (w == 0) {
+            // remove voter if present
+            if (isVoter[v]) {
+                // reduce totalVotingPower by their old weight (defensive)
+                if (old > 0 && totalVotingPower >= old) {
                     totalVotingPower -= old;
                 }
-                isVoter[v] = false;
+                // keep voterIndex intact until _remove reads it
                 votingPower[v] = 0;
+                isVoter[v] = false;
                 _remove(v);
-            }
-        } else {
-            if(!isVoter[v]){
-                // add new voter
-                isVoter[v] = true;
-                votersList.push(v);
-                voterIndex[v] = votersList.length; // 1-based
-            }
-            // update totals
-            // safe math: totalVotingPower = totalVotingPower + w - old;
-            if(w >= old) {
-                totalVotingPower += (w - old);
+                emit VoterRemoved(v);
             } else {
-                totalVotingPower -= (old - w);
+                // not a voter -> nothing to do, but ensure weight is zero
+                votingPower[v] = 0;
             }
-            votingPower[v] = w;
+            emit VoterUpdated(v, 0);
+            return;
         }
-        emit VoterUpdated(v,w);
+
+        // adding or updating a voter
+        if (!isVoter[v]) {
+            isVoter[v] = true;
+            votersList.push(v);
+            voterIndex[v] = votersList.length; // 1-based
+        }
+        // update totalVotingPower safely
+        if (w >= old) {
+            totalVotingPower += (w - old);
+        } else {
+            // w < old
+            // old - w won't underflow because old >= w
+            totalVotingPower -= (old - w);
+        }
+        votingPower[v] = w;
+        emit VoterUpdated(v, w);
     }
 
     function batchSetVoters(address[] calldata a,uint256[] calldata w) external onlyAdmin {
         require(a.length==w.length,"Length mismatch");
-        for(uint i = 0; i < a.length; i++) setVoter(a[i], w[i]);
+        for(uint i = 0; i < a.length; ){
+            setVoter(a[i], w[i]);
+            unchecked { ++i; }
+        }
     }
 
     // ---- Parameter Update Functions ----
@@ -195,8 +213,7 @@ contract Project {
     function quorumFor(uint256 id) public view returns(uint256){
         Proposal storage p = proposals[id];
         // rounding up: (total * quorum + 100 - 1) / 100
-        // explicit 100 - 1 makes intent clear
-        return (p.totalVotingPowerSnapshot * quorumPercent + 100 - 1) / 100;
+        return (p.totalVotingPowerSnapshot * quorumPercent + 99) / 100;
     }
 
     /// @notice Return the full voters list (careful: can be large)
@@ -219,14 +236,19 @@ contract Project {
     // ---- Storage-cleanup helper ----
     /// @notice Clears stored per-proposal snapshots and voters list for a processed proposal.
     /// Use to reclaim storage after a proposal is executed or cancelled.
-    function clearProposalSnapshots(uint256 id) external onlyAdmin proposalExists(id) {
+    /// Can be called by admin or the original proposer to allow DAO-opposed cleanups.
+    function clearProposalSnapshots(uint256 id) external proposalExists(id) {
         Proposal storage p = proposals[id];
         require(p.executed || p.canceled, "Only processed proposals");
+        require(msg.sender == admin || msg.sender == p.proposer, "Not allowed");
+
         address[] storage pv = proposalVoters[id];
-        for (uint i = 0; i < pv.length; i++) {
+        uint256 len = pv.length;
+        for (uint256 i = 0; i < len; ) {
             address v = pv[i];
             // delete snapshot weight (sets to 0)
             delete snapshot[id][v];
+            unchecked { ++i; }
         }
         // delete the array of voters
         delete proposalVoters[id];
@@ -236,9 +258,9 @@ contract Project {
     // ---- Internal ----
     function _remove(address who) internal {
         uint256 idx = voterIndex[who];
-        if(idx == 0) return; // not present
+        if (idx == 0) return; // not present
         uint256 last = votersList.length;
-        if(idx != last){
+        if (idx != last){
             address lastAddr = votersList[last-1];
             votersList[idx-1] = lastAddr;
             voterIndex[lastAddr] = idx;
@@ -257,4 +279,4 @@ contract Project {
         totalVotingPower += weight;
         emit VoterUpdated(who, weight);
     }
-}
+}      
