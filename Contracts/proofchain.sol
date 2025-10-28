@@ -68,7 +68,6 @@ contract Project {
         _;
     }
     modifier proposalExists(uint256 id) {
-        // more explicit: id must be within known range
         require(id > 0 && id <= proposalCount, "No proposal");
         _;
     }
@@ -183,6 +182,7 @@ contract Project {
     // ---- Admin Controls ----
 
     /// @notice Set or update a voter's weight. Weight 0 removes the voter.
+    /// @dev Emits VoterAdded/VoterRemoved and VoterUpdated where appropriate.
     function setVoter(address v, uint256 w) public onlyAdmin nonReentrant {
         require(v != address(0), "Zero addr");
         uint256 old = votingPower[v];
@@ -194,13 +194,13 @@ contract Project {
                 if (old > 0 && totalVotingPower >= old) {
                     totalVotingPower -= old;
                 }
-                // set to not a voter and remove from list
+                // clear data and remove from list
                 votingPower[v] = 0;
                 isVoter[v] = false;
                 _remove(v);
                 emit VoterRemoved(v);
             } else {
-                // not a voter -> ensure weight is zero
+                // not a voter -> ensure weight is zero (idempotent)
                 votingPower[v] = 0;
             }
             emit VoterUpdated(v, 0);
@@ -209,13 +209,18 @@ contract Project {
 
         // adding or updating a voter
         if (!isVoter[v]) {
+            // add to voters list first
             isVoter[v] = true;
             votersList.push(v);
             voterIndex[v] = votersList.length; // 1-based
+            votingPower[v] = w;
+            totalVotingPower += w;
             emit VoterAdded(v, w);
+            emit VoterUpdated(v, w);
+            return;
         }
 
-        // update totalVotingPower safely
+        // existing voter -> adjust totalVotingPower safely then update weight
         if (w >= old) {
             totalVotingPower += (w - old);
         } else {
@@ -227,7 +232,8 @@ contract Project {
         emit VoterUpdated(v, w);
     }
 
-    function batchSetVoters(address[] calldata a, uint256[] calldata w) external onlyAdmin {
+    /// @notice Batch set voters. Lengths must match.
+    function batchSetVoters(address[] calldata a, uint256[] calldata w) external onlyAdmin nonReentrant {
         require(a.length == w.length, "Length mismatch");
         for (uint256 i = 0; i < a.length; ) {
             setVoter(a[i], w[i]);
@@ -268,7 +274,7 @@ contract Project {
         emit ParameterUpdated("proposalDetails", id);
     }
 
-    function transferAdmin(address n) external onlyAdmin {
+    function transferAdmin(address n) external onlyAdmin nonReentrant {
         require(n != address(0), "Zero addr");
         emit AdminTransferred(admin, n);
         admin = n;
@@ -310,6 +316,34 @@ contract Project {
     /// @notice Convenience: return the Proposal struct
     function getProposal(uint256 id) external view proposalExists(id) returns (Proposal memory) {
         return proposals[id];
+    }
+
+    /// @notice Returns current total voting power (live, not snapshot)
+    function getTotalVotingPower() external view returns (uint256) {
+        return totalVotingPower;
+    }
+
+    /// @notice Helper: return proposal outcome info
+    function getProposalOutcome(uint256 id)
+        external
+        view
+        proposalExists(id)
+        returns (
+            bool executed,
+            bool canceled,
+            bool passed,
+            uint256 forVotes,
+            uint256 againstVotes,
+            uint256 quorumRequired
+        )
+    {
+        Proposal storage p = proposals[id];
+        executed = p.executed;
+        canceled = p.canceled;
+        forVotes = p.forVotes;
+        againstVotes = p.againstVotes;
+        passed = p.forVotes > p.againstVotes;
+        quorumRequired = quorumFor(id);
     }
 
     // ---- Storage-cleanup helper ----
