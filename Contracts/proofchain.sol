@@ -76,13 +76,16 @@ contract Project {
         _;
     }
 
-    // ---- Simple reentrancy guard ----
+    // ---- Simple reentrancy guard (standard pattern) ----
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
     uint256 private _status;
+
     modifier nonReentrant() {
-        require(_status != 1, "Reentrant");
-        _status = 1;
+        require(_status == _NOT_ENTERED, "Reentrant");
+        _status = _ENTERED;
         _;
-        _status = 0;
+        _status = _NOT_ENTERED;
     }
 
     // ---- Constructor ----
@@ -90,10 +93,11 @@ contract Project {
     constructor(uint8 _q) {
         require(_q > 0 && _q <= 100, "Invalid quorum");
         admin = msg.sender;
+        quorumPercent = _q;
+        _status = _NOT_ENTERED;
+
         // initial admin is also a voter with weight 1
         _addNewVoter(msg.sender, 1);
-        quorumPercent = _q;
-        _status = 0;
     }
 
     // ---- Core DAO Functions ----
@@ -108,6 +112,8 @@ contract Project {
         uint256 days_
     ) external onlyVoter notPaused nonReentrant {
         require(bytes(t).length > 0 && days_ > 0, "Invalid input");
+
+        // incremental id
         proposalCount++;
         uint256 pid = proposalCount;
         uint256 total;
@@ -161,9 +167,10 @@ contract Project {
     }
 
     /// @notice Execute a processed proposal (any voter may call to finalize)
+    /// @dev Requires quorum based on proposal snapshot
     function executeProposal(uint256 id) external onlyVoter proposalExists(id) notPaused nonReentrant {
         Proposal storage p = proposals[id];
-        require(!p.executed && !p.canceled && block.timestamp > p.deadline, "Cannot execute");
+        require(!p.executed && !p.canceled && block.timestamp >= p.deadline, "Cannot execute");
         require(p.forVotes + p.againstVotes >= quorumFor(id), "No quorum");
         p.executed = true;
         bool passed = p.forVotes > p.againstVotes;
@@ -344,6 +351,11 @@ contract Project {
         againstVotes = p.againstVotes;
         passed = p.forVotes > p.againstVotes;
         quorumRequired = quorumFor(id);
+    }
+
+    /// @notice Check whether an address voted on a proposal
+    function didVote(uint256 id, address who) external view proposalExists(id) returns (bool) {
+        return hasVoted[id][who];
     }
 
     // ---- Storage-cleanup helper ----
